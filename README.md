@@ -13,7 +13,12 @@
 
 服务端特征库以**不可变版本**发布：草稿提交完整特征库并基于 `base_version`
 计算增删改差异；激活在单个 SQLite 事务内确认基线仍是当前版本后原子切换，
-冲突返回 409；历史版本不可改，可作为回退时新草稿的来源。
+冲突返回 409；历史版本不可改，可作为回退时新草稿的来源。**草稿上线前**可
+发起历史判定回放：请求开始冻结当前最大 `judgment_id` 水位，只重放水位内
+使用服务端特征库的判定（沿用原观测与四项阈值，改用草稿快照跑现有判定算法），
+内联库记录按原因跳过；结果按 `unchanged` / `match_gained` / `match_lost` /
+`winner_changed` 分类并保存旧、新最佳候选证据，幂等键去重（重试返回原报告、
+被另一版本占用 409、并发不产生重复报告），回放不写入 `judgments`。
 
 现场设备通过 `POST /field-devices/{device_id}/batches` 以**链式批次**上传观测：
 每批含从 1 递增的 `sequence`、设备内唯一的 `batch_id`、引用上一批摘要的
@@ -73,6 +78,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/library/versions/{id}` | 版本详情（元数据 + 完整特征库快照） |
 | `GET` | `/library/versions/{id}/diff` | 查询版本相对 `base_version` 的增删改 |
 | `POST` | `/library/versions/{id}/activate` | 激活草稿：单事务校验基线并原子切换，冲突返回 409 |
+| `POST` | `/library/versions/{id}/replay-reports` | 草稿上线评估：冻结判定水位回放历史判定，四类分类 + 旧新候选证据（幂等键去重，冲突 409） |
+| `GET` | `/library/versions/{id}/replay-reports/{rid}` | 查看回放报告摘要（冻结水位、参与/跳过计数、四类计数） |
+| `GET` | `/library/versions/{id}/replay-reports/{rid}/changes` | 按原 `judgment_id` 游标分页回放变更明细（可按 `change_type` 过滤） |
 | `POST` | `/library/import` | 导入 JSON 特征库（兼容旧接口；基于当前版本原子创建并激活新版本） |
 | `GET` | `/library` | 查看当前激活特征库（含 `library_version`） |
 | `POST` | `/judge` | 判定观测序列，结果落库（响应与记录保存 `library_version`） |
@@ -165,7 +173,117 @@ curl -s -X POST http://localhost:8000/library/versions/<新草稿号>/activate
 `last_event_at` 列（回填为链头批次的受理事件）。全新部署则无初始版本，首次
 `/library/import` 即创建版本 1。
 
-### 3. 判定观测序列
+### 3. 草稿上线前评估（历史判定回放）
+
+草稿激活前，先知道它会怎样改写既有判定：以草稿快照重放历史 `/judge`
+记录，但不污染既有数据。回放接口只需要一个幂等键：
+
+```bash
+# 发起回放：冻结当前最大 judgment_id 水位，重放水位内服务端特征库判定
+curl -s -X POST http://localhost:8000/library/versions/2/replay-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key": "draft-2-eval-001"}'
+```
+
+也可以直接用示例脚本跑完整流程（创建草稿 → 回放 → 分页拉取变更）：
+
+```bash
+python3 samples/evaluate_draft.py samples/library.json
+```
+
+**回放规则**：
+
+- 请求开始（预约事务内）即冻结水位 `watermark = MAX(judgments.id)`：只重放
+  水位内的判定，回放期间乃至之后产生的新判定**不会混入**本报告；
+- 只重放**使用服务端特征库**（`library_source=stored`，记录保存了版本号）的
+  判定；使用**内联库**的判定与草稿无关，按 `inline_library` 原因跳过并计数；
+  旧版迁移产生的无结构记录按 `legacy_record` 跳过（计入 `skipped_by_reason`，
+  不参与分类）；
+- 每条重放记录**沿用原观测与四项阈值**（`tolerance` / `max_drift` /
+  `max_missed` / `max_false`），改用草稿版本的不可变快照执行与 `/judge`
+  **完全相同**的现有判定算法；
+- 回放只写回放报告两张表，**不写入 `judgments`**，也不改动任何既有判定。
+
+**四类分类**（比对原响应与草稿下的新裁决，逐条保存旧、新最佳候选证据）：
+
+| 分类 | 含义 |
+| --- | --- |
+| `unchanged` | 前后都无候选，或最佳航标编号不变 |
+| `match_gained` | 原无合格候选，草稿下匹配到航标 |
+| `match_lost` | 原匹配航标，草稿下无合格候选 |
+| `winner_changed` | 前后都匹配，但最佳航标编号改变 |
+
+**报告摘要**（POST 响应即摘要加第一页明细，也可随时用 GET 取回）：
+
+```json
+{
+  "report_id": 1,
+  "version_id": 2,
+  "idempotency_key": "draft-2-eval-001",
+  "status": "completed",
+  "watermark": 12,
+  "considered": 12,
+  "replayed_count": 10,
+  "skipped_count": 2,
+  "skipped_by_reason": {"inline_library": 2},
+  "summary": {"unchanged": 7, "match_gained": 1, "match_lost": 1, "winner_changed": 1},
+  "error": null,
+  "created_at": "…",
+  "completed_at": "…",
+  "count": 3,
+  "changes": [ /* 第一页变更明细，结构见下 */ ],
+  "next_cursor": null
+}
+```
+
+每条变更明细保存**旧、新最佳候选证据**：`old_best` / `new_best` 即 `/judge`
+响应里 `best` 的完整候选详情（`events` 逐事件对应、`missed_flashes`、
+`unmatched_observations` 等；无合格候选时为 `null`，原因在 `old_reason` /
+`new_reason`），同时给出 `old_status` / `new_status` 与
+`old_best_aid_id` / `new_best_aid_id`：
+
+```json
+{
+  "judgment_id": 7,
+  "change_type": "winner_changed",
+  "old_status": "matched",
+  "new_status": "matched",
+  "old_best_aid_id": "CN-001",
+  "new_best_aid_id": "CN-009",
+  "old_reason": null,
+  "new_reason": null,
+  "old_best": {"aid_id": "CN-001", "matched": 58, "events": [ "…" ]},
+  "new_best": {"aid_id": "CN-009", "matched": 58, "events": [ "…" ]}
+}
+```
+
+**按原 `judgment_id` 游标分页**查询变更明细：
+
+```bash
+# 默认只返回发生变化的记录（排除 unchanged），游标为上一页 next_cursor
+curl -s "http://localhost:8000/library/versions/2/replay-reports/1/changes?limit=50"
+curl -s "http://localhost:8000/library/versions/2/replay-reports/1/changes?after_judgment_id=7&limit=50"
+
+# 显式过滤某一类（含 unchanged：检查哪些记录前后都无候选等）
+curl -s "http://localhost:8000/library/versions/2/replay-reports/1/changes?change_type=unchanged"
+```
+
+只要报告摘要：`GET /library/versions/{id}/replay-reports/{rid}`。报告不可变；
+草稿激活后历史报告仍可查询，但不能再对非草稿版本发起新回放（返回 400）。
+
+**幂等与并发**：
+
+- 相同 `idempotency_key` 重试返回**原报告**（首次 `201`，重试 `200`），
+  不会重新计算、不会生成重复明细；
+- 幂等键全局唯一：已被**另一版本**占用时返回
+  `409 {"detail": {"error": "replay_key_conflict", "existing_report_id": …,
+  "existing_version_id": …}}`；
+- 并发同键请求在预约事务内由写锁 + 唯一约束串行化：一个请求执行回放，
+  其余请求等待同一份报告完成后返回它（执行时间过长时返回 `503` 并附
+  `Retry-After: 1`，稍后用同键重试即可），**并发绝不生成重复报告**；
+- 首个请求若计算失败，报告标记 `failed`，随后同键同版本请求可重新预约重试。
+
+### 4. 判定观测序列
 
 生成一份合成观测（含钟漂、噪声、2 次漏记、2 次误记）并提交判定：
 
@@ -199,7 +317,7 @@ curl -s -X POST http://localhost:8000/judge \
 - `judgment_id`：判定记录 ID，可用于 `GET /judgments/{id}` 回溯；
   判定记录同样保存 `library_version`，可按版本号精确复现当时使用的特征库。
 
-### 4. 巡检整体核对（多窗口 ↔ 计划航线）
+### 5. 巡检整体核对（多窗口 ↔ 计划航线）
 
 生成一份示例巡检请求（3 个航点、3 个观测窗口：1 个噪声窗口、1 个漏巡航点）
 并提交整体核对：
@@ -250,14 +368,14 @@ curl -s -X POST http://localhost:8000/patrols/analyze \
 5. 钟漂绝对值总和最小；
 6. 航点索引序列字典序最小（另以窗口索引序列作稳定性补充，保证结果确定可复现）。
 
-### 5. 查询判定记录
+### 6. 查询判定记录
 
 ```bash
 curl -s http://localhost:8000/judgments?limit=10
 curl -s http://localhost:8000/judgments/1
 ```
 
-### 6. 现场设备批次链（断网续传与冲突恢复）
+### 7. 现场设备批次链（断网续传与冲突恢复）
 
 现场设备把观测按**批次链**上传：每台设备一条链，`sequence` 从 1 递增，
 `previous_digest` 引用上一批摘要（首批为空串 `""`）。服务端只保存观测时间戳
@@ -408,7 +526,7 @@ curl -s "http://localhost:8000/field-devices/dev-01/batches?after_sequence=2&lim
 curl -s http://localhost:8000/field-devices/dev-01/batches/2
 ```
 
-### 7. 多处理方确认与安全归档水位（safe_sequence）
+### 8. 多处理方确认与安全归档水位（safe_sequence）
 
 同一台设备的批次会被多个下游处理方消费。服务端为每台设备维护必需消费者
 登记、稀疏确认与连续水位，给出**全部处理方都确认完毕、可安全归档的连续
@@ -563,7 +681,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认共 74 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 草稿回放共 84 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -574,15 +692,17 @@ app/
   main.py    FastAPI 路由与应用工厂
   align.py   相位-钟漂联合估计与循环对齐核心算法
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
+  replay.py  草稿上线评估：冻结水位回放历史判定、四类分类与旧新候选证据
   batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
   models.py  请求数据模型（Pydantic）
-  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链 +
-             多消费者稀疏确认与安全归档水位，含首次迁移）
+  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
+             设备批次链 + 多消费者稀疏确认与安全归档水位，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库
   generate_request.py         合成示例判定请求
   generate_patrol_request.py  合成示例巡检核对请求
+  evaluate_draft.py           草稿上线前回放评估完整流程示例
 tests/                  pytest 测试
 Dockerfile / docker-compose.yml
 ```

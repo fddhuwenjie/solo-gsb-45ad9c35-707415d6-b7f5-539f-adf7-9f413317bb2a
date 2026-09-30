@@ -221,3 +221,24 @@ class BatchAckRequest(BaseModel):
         if not re.fullmatch(r"[0-9a-f]{64}", s):
             raise ValueError("batch_digest must be a 64-char lowercase hex sha256")
         return s
+
+
+class ReplayReportRequest(BaseModel):
+    """草稿特征库上线评估：创建历史判定回放报告。
+
+    请求仅携带 ``idempotency_key``：预约时冻结当前最大 ``judgment_id`` 作为
+    水位，只重放该水位内使用服务端特征库的判定（内联库判定按原因跳过）。
+    相同键重试返回原报告；键被另一版本占用返回 409。
+    """
+
+    idempotency_key: str = Field(
+        min_length=1, max_length=200, description="客户端生成的回放幂等键（全局唯一）"
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _strip_key(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("idempotency_key must not be empty")
+        return s

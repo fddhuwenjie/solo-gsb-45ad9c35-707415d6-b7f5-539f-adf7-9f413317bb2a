@@ -10,6 +10,7 @@ from .db import (
     BatchNotFound,
     ConsumerConflict,
     Database,
+    ReplayKeyConflict,
     VersionConflict,
     VersionNotFound,
     VersionStateError,
@@ -21,9 +22,11 @@ from .models import (
     JudgeRequest,
     LibraryImportRequest,
     PatrolAnalyzeRequest,
+    ReplayReportRequest,
     VersionCreateRequest,
 )
 from .patrol import PatrolWaypoint, analyze_patrol
+from .replay import ReplayWaitTimeout, start_replay_report
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -40,8 +43,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "多下游处理方先登记为必需消费者，再以 consumer_id/sequence/batch_digest "
             "确认批次（乱序、并发、重复安全）；设备 safe_sequence 取各消费者连续"
             "水位最小值，给出可安全归档的连续前缀。"
+            "草稿上线前可发起历史判定回放：冻结判定水位后只用草稿快照重放"
+            "水位内服务端特征库判定（内联库判定按原因跳过），按 unchanged / "
+            "match_gained / match_lost / winner_changed 分类并保存旧新最佳候选证据，"
+            "幂等键去重（重试返回原报告、被他版本占用 409），回放不写入 judgments。"
         ),
-        version="1.5.0",
+        version="1.6.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -115,6 +122,101 @@ def create_app(db_path: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
         except VersionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.post(
+        "/library/versions/{version_id}/replay-reports",
+        status_code=201,
+        summary="创建草稿历史判定回放报告（上线前评估）",
+        description=(
+            "请求开始即冻结当前最大 judgment_id 为水位，只重放该水位内使用"
+            "服务端特征库的判定记录；内联库与旧库记录按原因跳过（计数到 "
+            "skipped_by_reason）。每条记录沿用原观测与四项阈值，改用草稿快照"
+            "执行现有判定算法，按 unchanged / match_gained / match_lost / "
+            "winner_changed 分类并保存旧、新最佳候选证据。"
+            "idempotency_key 全局唯一：相同键重试返回原报告（HTTP 200），"
+            "键被另一版本占用返回 409，并发同键只生成一份报告。"
+            "新判定不写入 judgments，水位之后的新判定不会混入本报告。"
+            "仅 draft 版本可回放（激活后历史记录不可变）。"
+        ),
+    )
+    def create_replay_report(
+        req: ReplayReportRequest,
+        response: Response,
+        version_id: int,
+    ) -> dict:
+        try:
+            report, created = start_replay_report(
+                app.state.db,
+                version_id,
+                req.idempotency_key,
+                grid_max_steps=config.grid_max_steps(),
+                seed_top_k=config.seed_top_k(),
+            )
+        except VersionNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except VersionStateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ReplayKeyConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        except ReplayWaitTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                headers={"Retry-After": "1"},
+                detail={
+                    "error": "replay_still_running",
+                    "message": str(exc),
+                    "report_id": exc.report_id,
+                },
+            )
+        if not created:
+            response.status_code = 200
+        page = app.state.db.list_replay_items(
+            version_id, report["report_id"], after_judgment_id=0, limit=50
+        )
+        return {**report, **{k: page[k] for k in ("count", "changes", "next_cursor")}}
+
+    @app.get(
+        "/library/versions/{version_id}/replay-reports/{report_id}",
+        summary="查看回放报告摘要",
+        description="返回冻结水位、参与/跳过计数与四类变更摘要（不含明细）。",
+    )
+    def get_replay_report(version_id: int, report_id: int) -> dict:
+        report = app.state.db.get_replay_report(version_id, report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="replay report not found")
+        return report
+
+    @app.get(
+        "/library/versions/{version_id}/replay-reports/{report_id}/changes",
+        summary="按原 judgment_id 游标分页查询回放变更明细",
+        description=(
+            "按原 judgment_id 升序返回回放明细（含旧/新最佳候选证据）。"
+            "change_type 缺省只返回发生变化的记录（排除 unchanged），"
+            "显式传 unchanged 等四类之一时只返回该类。"
+            "after_judgment_id 为游标（上一页 next_cursor）。"
+        ),
+    )
+    def list_replay_changes(
+        version_id: int,
+        report_id: int,
+        after_judgment_id: int = Query(0, ge=0, description="起始游标：返回 judgment_id 大于该值的明细"),
+        limit: int = Query(50, ge=1, le=200),
+        change_type: str | None = Query(
+            None,
+            pattern="^(unchanged|match_gained|match_lost|winner_changed)$",
+            description="只返回该分类；缺省返回全部发生变化的记录（排除 unchanged）",
+        ),
+    ) -> dict:
+        page = app.state.db.list_replay_items(
+            version_id,
+            report_id,
+            after_judgment_id=after_judgment_id,
+            limit=limit,
+            change_type=change_type,
+        )
+        if page is None:
+            raise HTTPException(status_code=404, detail="replay report not found")
+        return page
 
     @app.post(
         "/library/import",
