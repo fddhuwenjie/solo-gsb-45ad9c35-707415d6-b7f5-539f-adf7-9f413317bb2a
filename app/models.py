@@ -202,6 +202,28 @@ class ConsumerRegisterRequest(BaseModel):
     )
 
 
+class ReplayReportRequest(BaseModel):
+    """为草稿版本创建回放报告：携带客户端幂等键。
+
+    报告开始时冻结当前最大 ``judgment_id`` 作为水位，只重放该水位内使用
+    服务端特征库的判定记录（内联库记录按原因跳过）。相同键重试返回原报告；
+    键已被其他版本占用时返回 409。
+    """
+
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（全局唯一；同键重试返回原报告）",
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+
 class BatchAckRequest(BaseModel):
     """下游消费者对单个批次的处理确认。
 

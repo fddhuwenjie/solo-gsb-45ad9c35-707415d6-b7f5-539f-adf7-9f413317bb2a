@@ -1,10 +1,19 @@
-"""SQLite 持久层：不可变特征库版本、判定记录与现场设备批次链。
+"""SQLite 持久层：不可变特征库版本、判定记录、现场设备批次链与草稿回放报告。
 
 特征库以版本为单位不可变存储：
 
 - ``library_versions``：版本元数据，状态机 draft → active → historical；
 - ``library_version_aids``：每个版本的完整航标快照（版本不可变，可复算差异）；
 - ``library_state``：单行表，指向当前激活版本。
+
+草稿回放报告（上线前评估草稿会如何改写既有判定）：
+
+- ``replay_reports``：报告元数据——目标草稿版本、全局唯一的幂等键、开始时
+  冻结的判定水位（当前最大 ``judgment_id``）与各类计数；
+- ``replay_report_items``：逐条明细——服务端库记录保存新旧最佳候选证据与
+  四分类（``unchanged`` / ``match_gained`` / ``match_lost`` /
+  ``winner_changed``），内联库记录以 ``item_status='skipped'`` 加跳过原因
+  保存。幂等键全局唯一（唯一约束兜底并发）；回放不写入 ``judgments``。
 
 现场设备批次链：
 
@@ -130,6 +139,43 @@ CREATE TABLE IF NOT EXISTS device_batch_acks (
     confirmed_at     REAL NOT NULL,
     UNIQUE (device_id, consumer_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS replay_reports (
+    report_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id      INTEGER NOT NULL REFERENCES library_versions(version_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    watermark       INTEGER NOT NULL,
+    total_count     INTEGER NOT NULL,
+    replayed_count  INTEGER NOT NULL,
+    skipped_count   INTEGER NOT NULL,
+    unchanged       INTEGER NOT NULL DEFAULT 0,
+    match_gained    INTEGER NOT NULL DEFAULT 0,
+    match_lost      INTEGER NOT NULL DEFAULT 0,
+    winner_changed  INTEGER NOT NULL DEFAULT 0,
+    created_at      REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS replay_report_items (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id           INTEGER NOT NULL REFERENCES replay_reports(report_id),
+    judgment_id         INTEGER NOT NULL,
+    item_status         TEXT NOT NULL
+        CHECK (item_status IN ('replayed', 'skipped')),
+    classification      TEXT
+        CHECK (classification IS NULL OR classification IN
+               ('unchanged', 'match_gained', 'match_lost', 'winner_changed')),
+    skip_reason         TEXT,
+    old_status          TEXT,
+    old_best_aid_id     TEXT,
+    old_reason          TEXT,
+    old_library_version INTEGER,
+    old_best            TEXT,
+    new_status          TEXT,
+    new_best_aid_id     TEXT,
+    new_reason          TEXT,
+    new_best            TEXT,
+    UNIQUE (report_id, judgment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_replay_items_cursor
+    ON replay_report_items (report_id, judgment_id);
 """
 
 
@@ -143,6 +189,28 @@ class VersionStateError(Exception):
 
 class VersionConflict(Exception):
     """激活时草稿的 base_version 已不再是当前激活版本（乐观并发冲突）。"""
+
+
+class ReplayConflict(Exception):
+    """回放幂等键已被另一个版本占用（HTTP 409），detail 附占用方信息。"""
+
+    def __init__(
+        self,
+        *,
+        message: str,
+        idempotency_key: str,
+        occupied_by_version: int,
+        occupied_by_report: int,
+    ):
+        super().__init__(message)
+        self.detail = {
+            "error": "replay_conflict",
+            "reason": "idempotency_key_in_use",
+            "message": message,
+            "idempotency_key": idempotency_key,
+            "occupied_by_version": occupied_by_version,
+            "occupied_by_report": occupied_by_report,
+        }
 
 
 class BatchConflict(Exception):
@@ -227,6 +295,9 @@ class Database:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
+        # 写锁竞争时等待而非立即抛 database is locked，使
+        # 「BEGIN IMMEDIATE 串行化写事务」在多连接（多 worker）下同样成立
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     @contextmanager
@@ -1039,4 +1110,331 @@ class Database:
             "first_gap": safe_sequence + 1,
             "blocking_consumers": blocking,
             "consumers": statuses,
+        }
+
+    # ---------------- 草稿回放报告 ----------------
+
+    @staticmethod
+    def _replay_summary(report_row) -> dict:
+        """组装回放报告摘要（不含逐条明细，明细走游标分页接口）。"""
+        return {
+            "report_id": report_row["report_id"],
+            "version_id": report_row["version_id"],
+            "idempotency_key": report_row["idempotency_key"],
+            "watermark_judgment_id": report_row["watermark"],
+            "created_at": _iso(report_row["created_at"]),
+            "total_judgments": report_row["total_count"],
+            "replayed_count": report_row["replayed_count"],
+            "skipped_count": report_row["skipped_count"],
+            "changes": {
+                "unchanged": report_row["unchanged"],
+                "match_gained": report_row["match_gained"],
+                "match_lost": report_row["match_lost"],
+                "winner_changed": report_row["winner_changed"],
+            },
+        }
+
+    def create_replay_report(
+        self, version_id: int, idempotency_key: str, runner
+    ) -> tuple[dict, bool]:
+        """为草稿创建回放报告；整个流程（冻结水位 → 重放 → 落库）在单个
+        BEGIN IMMEDIATE 事务内完成。
+
+        - 目标版本必须存在且为 ``draft``（不存在抛 :class:`VersionNotFound`，
+          非草稿抛 :class:`VersionStateError`）；
+        - ``idempotency_key`` 全局唯一：同版本同键重试返回原报告
+          （``created=False``，HTTP 200）；键已被**其他版本**占用抛
+          :class:`ReplayConflict`（HTTP 409）。写锁串行化 + 唯一约束兜底，
+          并发请求不会生成重复报告；
+        - 开始时冻结当前最大 ``judgment_id`` 作为水位，只重放水位内的记录：
+          请求携带内联 ``library`` 的记录按原因跳过，载荷缺字段的历史记录
+          同样跳过；其余沿用原观测与四项阈值，由调用方注入的 ``runner``
+          （草稿快照, 待回放记录）执行与 /judge 相同的判定算法。
+
+        回放结果只写入 ``replay_reports`` / ``replay_report_items``，
+        不写入 ``judgments``。
+        """
+        from .replay import (
+            SKIP_INLINE_LIBRARY,
+            SKIP_MISSING_INPUT,
+            classify_change,
+            has_replay_input,
+            is_inline_judgment,
+        )
+
+        now = time.time()
+        with self._write_tx() as conn:
+            version = conn.execute(
+                "SELECT status FROM library_versions WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+            if version is None:
+                raise VersionNotFound(f"version {version_id} not found")
+            if version["status"] != "draft":
+                raise VersionStateError(
+                    f"version {version_id} is {version['status']}; "
+                    "replay reports can only be created for a draft"
+                )
+
+            existing = conn.execute(
+                "SELECT * FROM replay_reports WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["version_id"] == version_id:
+                    return self._replay_summary(existing), False
+                raise ReplayConflict(
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by a "
+                        f"replay report of version {existing['version_id']}"
+                    ),
+                    idempotency_key=idempotency_key,
+                    occupied_by_version=existing["version_id"],
+                    occupied_by_report=existing["report_id"],
+                )
+
+            # 冻结水位：事务已持写锁，后续 /judge 的写入在本事务提交后才能进行，
+            # 新判定的 id 必然大于该水位，不会混入本次报告。
+            watermark_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM judgments"
+            ).fetchone()
+            watermark = int(watermark_row["m"])
+
+            judgment_rows = conn.execute(
+                "SELECT id, status, best_aid_id, library_version, request, response "
+                "FROM judgments WHERE id <= ? ORDER BY id",
+                (watermark,),
+            ).fetchall()
+
+            to_replay: list[dict] = []
+            rows_by_id: dict[int, sqlite3.Row] = {}
+            skipped: list[tuple[int, str, sqlite3.Row]] = []
+            for r in judgment_rows:
+                request = json.loads(r["request"])
+                if is_inline_judgment(request):
+                    skipped.append((r["id"], SKIP_INLINE_LIBRARY, r))
+                elif not has_replay_input(request):
+                    skipped.append((r["id"], SKIP_MISSING_INPUT, r))
+                else:
+                    rows_by_id[r["id"]] = r
+                    to_replay.append({"judgment_id": r["id"], "request": request})
+
+            outcomes = runner(self._aids_of(conn, version_id), to_replay)
+            outcomes_by_id = {o["judgment_id"]: o for o in outcomes}
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO replay_reports "
+                    "(version_id, idempotency_key, watermark, total_count, replayed_count, "
+                    "skipped_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        version_id,
+                        idempotency_key,
+                        watermark,
+                        len(judgment_rows),
+                        len(to_replay),
+                        len(skipped),
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 并发兜底：写锁通常已把同键请求串行化到上面的 SELECT；
+                # 若仍有并发事务抢先占用该键，按幂等/跨版本冲突处理
+                rival = conn.execute(
+                    "SELECT * FROM replay_reports WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if rival is not None and rival["version_id"] == version_id:
+                    return self._replay_summary(rival), False
+                raise ReplayConflict(
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by a "
+                        f"replay report of version {rival['version_id'] if rival else '?'}"
+                    ),
+                    idempotency_key=idempotency_key,
+                    occupied_by_version=int(rival["version_id"]) if rival else version_id,
+                    occupied_by_report=int(rival["report_id"]) if rival else 0,
+                )
+            report_id = int(cur.lastrowid)
+
+            for judgment_id, skip_reason, r in skipped:
+                conn.execute(
+                    "INSERT INTO replay_report_items "
+                    "(report_id, judgment_id, item_status, skip_reason, "
+                    "old_status, old_best_aid_id, old_reason, old_library_version) "
+                    "VALUES (?, ?, 'skipped', ?, ?, ?, ?, ?)",
+                    (
+                        report_id,
+                        judgment_id,
+                        skip_reason,
+                        r["status"],
+                        r["best_aid_id"],
+                        None,
+                        r["library_version"],
+                    ),
+                )
+
+            class_counts = {
+                "unchanged": 0,
+                "match_gained": 0,
+                "match_lost": 0,
+                "winner_changed": 0,
+            }
+            for rec in to_replay:
+                r = rows_by_id[rec["judgment_id"]]
+                old_response = json.loads(r["response"])
+                old_best = old_response.get("best")
+                old_reason = old_response.get("reason")
+                # 裁决状态/最佳编号以 judgments 权威列为准，证据以保存的首次响应为准
+                old_status = r["status"]
+                outcome = outcomes_by_id[rec["judgment_id"]]
+                new_best = outcome["best"]
+                new_status = outcome["status"]
+                classification = classify_change(
+                    old_status, old_best, new_status, new_best
+                )
+                class_counts[classification] += 1
+                conn.execute(
+                    "INSERT INTO replay_report_items "
+                    "(report_id, judgment_id, item_status, classification, "
+                    "old_status, old_best_aid_id, old_reason, old_library_version, "
+                    "old_best, new_status, new_best_aid_id, new_reason, new_best) "
+                    "VALUES (?, ?, 'replayed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        report_id,
+                        rec["judgment_id"],
+                        classification,
+                        old_status,
+                        r["best_aid_id"],
+                        old_reason,
+                        r["library_version"],
+                        json.dumps(old_best, ensure_ascii=False),
+                        new_status,
+                        new_best["aid_id"] if new_best is not None else None,
+                        outcome["reason"],
+                        json.dumps(new_best, ensure_ascii=False),
+                    ),
+                )
+
+            conn.execute(
+                "UPDATE replay_reports SET unchanged = ?, match_gained = ?, "
+                "match_lost = ?, winner_changed = ? WHERE report_id = ?",
+                (
+                    class_counts["unchanged"],
+                    class_counts["match_gained"],
+                    class_counts["match_lost"],
+                    class_counts["winner_changed"],
+                    report_id,
+                ),
+            )
+            report = conn.execute(
+                "SELECT * FROM replay_reports WHERE report_id = ?", (report_id,)
+            ).fetchone()
+            summary = self._replay_summary(report)
+        return summary, True
+
+    def get_replay_report(self, version_id: int, report_id: int) -> tuple[int, dict] | None:
+        """读取指定版本下的回放报告摘要；不属于该版本或不存在返回 None。
+
+        返回 ``(version_id, summary)``。
+        """
+        with closing(self._connect()) as conn:
+            r = conn.execute(
+                "SELECT * FROM replay_reports WHERE report_id = ? AND version_id = ?",
+                (report_id, version_id),
+            ).fetchone()
+        if r is None:
+            return None
+        return int(r["version_id"]), self._replay_summary(r)
+
+    def list_replay_changes(
+        self,
+        version_id: int,
+        report_id: int,
+        *,
+        after_judgment_id: int = 0,
+        limit: int = 50,
+        classification: str | None = None,
+        include_skipped: bool = False,
+    ) -> dict | None:
+        """按原 judgment_id 游标分页返回回放明细（升序）。
+
+        默认只返回已重放记录（可按四分类之一过滤）；``include_skipped=true``
+        时改返回被跳过记录（此时不允许再按 classification 过滤）。报告不
+        属于该版本或不存在时返回 None。
+        """
+        with closing(self._connect()) as conn:
+            report = conn.execute(
+                "SELECT 1 FROM replay_reports WHERE report_id = ? AND version_id = ?",
+                (report_id, version_id),
+            ).fetchone()
+            if report is None:
+                return None
+            if include_skipped:
+                rows = conn.execute(
+                    "SELECT * FROM replay_report_items "
+                    "WHERE report_id = ? AND item_status = 'skipped' "
+                    "AND judgment_id > ? ORDER BY judgment_id LIMIT ?",
+                    (report_id, after_judgment_id, limit + 1),
+                ).fetchall()
+            elif classification is not None:
+                rows = conn.execute(
+                    "SELECT * FROM replay_report_items "
+                    "WHERE report_id = ? AND item_status = 'replayed' "
+                    "AND classification = ? AND judgment_id > ? "
+                    "ORDER BY judgment_id LIMIT ?",
+                    (report_id, classification, after_judgment_id, limit + 1),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM replay_report_items "
+                    "WHERE report_id = ? AND item_status = 'replayed' "
+                    "AND judgment_id > ? ORDER BY judgment_id LIMIT ?",
+                    (report_id, after_judgment_id, limit + 1),
+                ).fetchall()
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items: list[dict] = []
+        for r in rows:
+            if r["item_status"] == "skipped":
+                items.append(
+                    {
+                        "judgment_id": r["judgment_id"],
+                        "item_status": "skipped",
+                        "skip_reason": r["skip_reason"],
+                        "old_status": r["old_status"],
+                        "old_best_aid_id": r["old_best_aid_id"],
+                        "old_library_version": r["old_library_version"],
+                    }
+                )
+            else:
+                items.append(
+                    {
+                        "judgment_id": r["judgment_id"],
+                        "item_status": "replayed",
+                        "classification": r["classification"],
+                        "old": {
+                            "status": r["old_status"],
+                            "best_aid_id": r["old_best_aid_id"],
+                            "reason": r["old_reason"],
+                            "library_version": r["old_library_version"],
+                            "best": json.loads(r["old_best"]),
+                        },
+                        "new": {
+                            "status": r["new_status"],
+                            "best_aid_id": r["new_best_aid_id"],
+                            "reason": r["new_reason"],
+                            "best": json.loads(r["new_best"]),
+                        },
+                    }
+                )
+        return {
+            "report_id": report_id,
+            "version_id": version_id,
+            "classification": classification,
+            "include_skipped": include_skipped,
+            "count": len(items),
+            "changes": items,
+            "next_cursor": items[-1]["judgment_id"] if has_more and items else None,
         }

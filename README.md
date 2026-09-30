@@ -15,6 +15,15 @@
 计算增删改差异；激活在单个 SQLite 事务内确认基线仍是当前版本后原子切换，
 冲突返回 409；历史版本不可改，可作为回退时新草稿的来源。
 
+草稿**上线前**可创建**回放报告**（`POST /library/versions/{id}/replay-reports`）：
+请求携带 `idempotency_key`，开始时冻结当前最大 `judgment_id` 作为水位，只
+重放水位内**使用服务端特征库**的判定记录（内联库记录按原因跳过）；每条
+记录沿用原观测与 `/judge` 四项阈值，改用草稿快照执行同一判定算法，按
+`unchanged` / `match_gained` / `match_lost` / `winner_changed` 四分类并保存
+旧、新最佳候选证据。相同键重试返回原报告（HTTP 200），键被其他版本占用
+返回 409，写锁加唯一约束保证并发不会生成重复报告；回放只读判定、**不写入
+`judgments`**，新判定也不会混入既有报告。
+
 现场设备通过 `POST /field-devices/{device_id}/batches` 以**链式批次**上传观测：
 每批含从 1 递增的 `sequence`、设备内唯一的 `batch_id`、引用上一批摘要的
 `previous_digest` 和 1～100 条按 `(captured_at, local_id)` 递增的观测；服务端
@@ -73,6 +82,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/library/versions/{id}` | 版本详情（元数据 + 完整特征库快照） |
 | `GET` | `/library/versions/{id}/diff` | 查询版本相对 `base_version` 的增删改 |
 | `POST` | `/library/versions/{id}/activate` | 激活草稿：单事务校验基线并原子切换，冲突返回 409 |
+| `POST` | `/library/versions/{id}/replay-reports` | 为草稿创建回放报告（幂等键；冻结判定水位、四分类、保存新旧证据；重试 200，跨版本占用 409） |
+| `GET` | `/library/versions/{id}/replay-reports/{rid}` | 查询回放报告摘要（水位与四分类计数） |
+| `GET` | `/library/versions/{id}/replay-reports/{rid}/changes` | 按原 `judgment_id` 游标分页查询变更明细（可按分类过滤、可查跳过记录） |
 | `POST` | `/library/import` | 导入 JSON 特征库（兼容旧接口；基于当前版本原子创建并激活新版本） |
 | `GET` | `/library` | 查看当前激活特征库（含 `library_version`） |
 | `POST` | `/judge` | 判定观测序列，结果落库（响应与记录保存 `library_version`） |
@@ -156,6 +168,128 @@ curl -s -X POST http://localhost:8000/library/versions/<新草稿号>/activate
 
 注意：以历史版本为 `base_version` 创建的草稿在激活时同样会因基线过期返回
 409——回退的草稿必须基于**当前激活版本**创建（内容可以来自任意历史版本）。
+
+### 2.5 草稿回放报告（上线前评估会怎样改写既有判定）
+
+草稿激活前，可基于该草稿对历史判定做一次**离线重放**，回答「这个库一旦
+上线，过去的判定会有多少改变、分别变成什么」。整个流程（冻结水位 → 逐条
+重放 → 落报告）在单个 SQLite 写事务内完成：
+
+1. 开始时冻结当前最大 `judgment_id` 作为**水位**：只重放 `id ≤ 水位` 的
+   记录；重放期间及之后新产生的判定 `id` 必然更大，**不会混入**本报告；
+2. 只重放**使用服务端特征库**的判定（`library_source=stored`）。请求携带
+   内联 `library` 的记录与服务端版本无关，以 `item_status=skipped`、
+   `skip_reason=inline_library` 跳过（可通过 `include_skipped=true` 查看）；
+3. 每条记录**沿用原观测与四项阈值**（`tolerance` / `max_drift` /
+   `max_missed` / `max_false`），只把特征库整体替换为草稿完整快照，复用与
+   `/judge` 完全相同的现有判定算法；
+4. 新旧裁决结果按四类归档，并保存**旧、新最佳候选证据**（与 `/judge` 的
+   `best` 结构相同：相位、钟漂、逐事件、漏记、未匹配观测；无匹配侧为
+   `null`，并保留该侧 `reason`）：
+
+| 分类 | 含义 |
+| --- | --- |
+| `unchanged` | 新旧均无合格候选，或最佳候选仍是同一航标 |
+| `match_gained` | 旧判定无合格候选，草稿下得到匹配 |
+| `match_lost` | 旧判定有匹配，草稿下变为无合格候选 |
+| `winner_changed` | 新旧均有匹配，但最佳航标编号改变 |
+
+```bash
+# ① 在当前激活版本之上准备草稿（不激活）
+curl -s -X POST http://localhost:8000/library/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version": 1, "aids": [
+        {"aid_id": "CN-001", "period": 10.0, "flashes": [0.0, 1.5]},
+        {"aid_id": "CN-009", "period": 6.0,  "flashes": [0.0]}
+      ]}'
+# → 记下草稿 version_id（假设为 2）
+
+# ② 创建回放报告（携带客户端生成的幂等键；网络重试请复用同一键）
+curl -s -X POST http://localhost:8000/library/versions/2/replay-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key": "draft-2-eval-2026-09-30"}'
+```
+
+```json
+{
+  "report_id": 1,
+  "version_id": 2,
+  "idempotency_key": "draft-2-eval-2026-09-30",
+  "watermark_judgment_id": 128,
+  "created_at": "2026-09-30T06:00:00+00:00",
+  "total_judgments": 130,
+  "replayed_count": 122,
+  "skipped_count": 8,
+  "changes": {
+    "unchanged": 114,
+    "match_gained": 3,
+    "match_lost": 4,
+    "winner_changed": 1
+  }
+}
+```
+
+- **幂等**：相同 `idempotency_key` 重试（同版本）返回**原报告**，HTTP 200、
+  `report_id`/水位/计数/创建时刻均不变，且不会重复计算或重复落库；
+- **跨版本占用 409**：同一个键已被**另一版本**的报告使用时返回
+  `409 Conflict`，`detail` 给出 `occupied_by_version` /
+  `occupied_by_report`，换一个键即可；
+- **并发安全**：写锁串行化 + `idempotency_key` 全局唯一约束兜底，同键并发
+  请求恰好一份 201，其余得到同一份 200，绝不生成重复报告；
+- 只有 `draft` 版本可创建报告（版本不存在 404、非草稿 400）；草稿随后被
+  激活或转为历史不影响已生成报告的查阅。
+
+**变更明细按原 `judgment_id` 游标分页**（升序，`after_judgment_id` 传上一页
+的 `next_cursor`），只关心改变时按分类过滤：
+
+```bash
+BASE=http://localhost:8000/library/versions/2/replay-reports/1
+
+# 首页（每页 50 条）
+curl -s "$BASE/changes?limit=50"
+# 下一页
+curl -s "$BASE/changes?limit=50&after_judgment_id=<上一页 next_cursor>"
+# 只看「最佳航标改变」与「失去匹配」
+curl -s "$BASE/changes?classification=winner_changed"
+curl -s "$BASE/changes?classification=match_lost"
+# 查看哪些历史记录被跳过（内联库）
+curl -s "$BASE/changes?include_skipped=true"
+```
+
+每条变更同时给出旧、新两侧的裁决结论与完整候选证据，便于直接对比：
+
+```json
+{
+  "report_id": 1,
+  "version_id": 2,
+  "count": 1,
+  "next_cursor": null,
+  "changes": [
+    {
+      "judgment_id": 57,
+      "item_status": "replayed",
+      "classification": "winner_changed",
+      "old": {
+        "status": "matched",
+        "best_aid_id": "CN-001",
+        "reason": null,
+        "library_version": 1,
+        "best": {"aid_id": "CN-001", "drift": 0.00012, "matched": 58, "…": "…"}
+      },
+      "new": {
+        "status": "matched",
+        "best_aid_id": "CN-009",
+        "reason": null,
+        "best": {"aid_id": "CN-009", "drift": -0.00003, "matched": 60, "…": "…"}
+      }
+    }
+  ]
+}
+```
+
+回放是**只读评估**：结果只写入 `replay_reports` /
+`replay_report_items`，绝不写入 `judgments`；既有判定记录、响应与
+`/judgments` 查询完全不受影响。确认草稿影响可接受后，再按 §2 的流程激活。
 
 **首次迁移**：服务启动时若发现旧版平铺 `aids` 表，会在单个事务内将其整体
 转为初始激活版本（`version_id=1`，`source="migration"`）并补充判定记录的
@@ -563,7 +697,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认共 74 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 草稿回放共 85 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -574,10 +708,11 @@ app/
   main.py    FastAPI 路由与应用工厂
   align.py   相位-钟漂联合估计与循环对齐核心算法
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
+  replay.py  草稿回放：用草稿快照沿用原观测/阈值重放历史判定并四分类
   batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
   models.py  请求数据模型（Pydantic）
-  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链 +
-             多消费者稀疏确认与安全归档水位，含首次迁移）
+  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
+             设备批次链 + 多消费者稀疏确认与安全归档水位，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库
